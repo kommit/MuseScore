@@ -26,6 +26,8 @@
 #include "dom/page.h"
 #include "dom/engravingitem.h"
 
+#include "../iengravingitempaintprovider.h"
+
 #include "tdraw.h"
 #include "debugpaint.h"
 
@@ -235,6 +237,7 @@ void Paint::paintItems(Painter& painter, const std::vector<EngravingItem*>& item
 {
     TRACEFUNC;
     std::vector<EngravingItem*> sortedItems(items.begin(), items.end());
+    const auto* itemPaintProvider = dynamic_cast<const IEngravingItemPaintProvider*>(painter.provider().get());
 
     std::sort(sortedItems.begin(), sortedItems.end(), mu::engraving::elementLessThan);
 
@@ -242,7 +245,13 @@ void Paint::paintItems(Painter& painter, const std::vector<EngravingItem*>& item
         if (!item->isInteractionAvailable()) {
             continue;
         }
-
-        paintItem(painter, item, opt);
+        if (itemPaintProvider) {
+            const std::string objectName = itemPaintProvider->objectNameForItem(item);
+            painter.beginObject(objectName);
+            paintItem(painter, item, opt);
+            painter.endObject();
+        } else {
+            paintItem(painter, item, opt);
+        }
     }
 }
