@@ -39,6 +39,16 @@ target_sources(iex_midi PRIVATE
     internal/notationmidiwriter.h
 )
 
+if (MUE_BUILD_ENGRAVING_DEVTOOLS)
+    target_sources(iex_midi PRIVATE
+        internal/notationscorebundlewriter.cpp
+        internal/notationscorebundlewriter.h
+        internal/scorebundle/displaylistpaintprovider.cpp
+        internal/scorebundle/displaylistpaintprovider.h
+    )
+    target_compile_definitions(iex_midi PRIVATE MUE_BUILD_SCORE_BUNDLE_EXPORT)
+endif()
+
 add_subdirectory(thirdparty/beatroot)
 
 target_link_libraries(iex_midi PRIVATE

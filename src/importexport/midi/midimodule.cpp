@@ -27,6 +27,9 @@
 #include "internal/notationmidireader.h"
 #include "project/inotationwritersregister.h"
 #include "internal/notationmidiwriter.h"
+#ifdef MUE_BUILD_SCORE_BUNDLE_EXPORT
+#include "internal/notationscorebundlewriter.h"
+#endif
 
 #include "internal/midiconfiguration.h"
 
@@ -58,6 +61,9 @@ void MidiModule::resolveImports()
     auto writers = globalIoc()->resolve<INotationWritersRegister>(moduleName());
     if (writers) {
         writers->reg({ "mid", "midi", "kar" }, std::make_shared<NotationMidiWriter>(globalCtx()));
+#ifdef MUE_BUILD_SCORE_BUNDLE_EXPORT
+        writers->reg({ "msbundle" }, std::make_shared<NotationScoreBundleWriter>(globalCtx()));
+#endif
     }
 }
 

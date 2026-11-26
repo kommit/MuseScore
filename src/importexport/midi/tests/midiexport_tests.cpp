@@ -20,12 +20,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <string_view>
 
 #include <gtest/gtest.h>
 
+#include <QBuffer>
 #include <QString>
 
 #include "global/io/ifilesystem.h"
@@ -36,6 +38,7 @@
 #include "engraving/compat/midi/compatmidirender.h"
 #include "engraving/compat/midi/compatmidirenderinternal.h"
 #include "engraving/dom/masterscore.h"
+#include "engraving/dom/synthesizerstate.h"
 #include "engraving/types/types.h"
 
 #include "engraving/tests/utils/scorecomp.h"
@@ -190,6 +193,61 @@ TEST_F(MidiExportTests, midi02) {
 /// write/read midi file with key sig
 TEST_F(MidiExportTests, midi03) {
     exportAndCompareWithRef("midi03");
+}
+
+TEST_F(MidiExportTests, traceDoesNotChangeMidiBytes) {
+    std::unique_ptr<MasterScore> score(
+        ScoreRW::readScore(MIDI_EXPORT_DATA_DIR + u"/testMeasureRepeats.mscx"));
+    ASSERT_TRUE(score);
+    score->doLayout();
+    score->rebuildMidiMapping();
+
+    QByteArray normalBytes;
+    QBuffer normalBuffer(&normalBytes);
+    ASSERT_TRUE(normalBuffer.open(QIODevice::WriteOnly));
+    ExportMidi normalExport(score.get());
+    ASSERT_TRUE(normalExport.write(&normalBuffer, true, true));
+
+    QByteArray tracedBytes;
+    QBuffer tracedBuffer(&tracedBytes);
+    ASSERT_TRUE(tracedBuffer.open(QIODevice::WriteOnly));
+    MidiExportTrace trace;
+    ExportMidi tracedExport(score.get());
+    ASSERT_TRUE(tracedExport.write(&tracedBuffer, true, true, SynthesizerState(), &trace));
+
+    EXPECT_EQ(normalBytes, tracedBytes);
+    EXPECT_FALSE(trace.events.empty());
+    EXPECT_FALSE(trace.activations.empty());
+    EXPECT_TRUE(std::any_of(trace.events.cbegin(), trace.events.cend(), [](const MidiExportEventTrace& event) {
+        return !event.sourceElementIds.empty();
+    }));
+    EXPECT_TRUE(std::all_of(trace.activations.cbegin(), trace.activations.cend(), [](const MidiExportActivation& activation) {
+        return std::find(activation.visualElementIds.cbegin(), activation.visualElementIds.cend(), activation.elementId)
+               != activation.visualElementIds.cend();
+    }));
+    EXPECT_TRUE(std::any_of(trace.activations.cbegin(), trace.activations.cend(), [](const MidiExportActivation& activation) {
+        return activation.visualElementIds.size() > 1;
+    }));
+}
+
+TEST_F(MidiExportTests, traceIncludesTiedVisualElements) {
+    std::unique_ptr<MasterScore> score(
+        ScoreRW::readScore(MIDI_EXPORT_DATA_DIR + u"/testSwing8thTies.mscx"));
+    ASSERT_TRUE(score);
+    score->doLayout();
+    score->rebuildMidiMapping();
+
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    ASSERT_TRUE(buffer.open(QIODevice::WriteOnly));
+    MidiExportTrace trace;
+    ExportMidi exporter(score.get());
+    ASSERT_TRUE(exporter.write(&buffer, true, true, SynthesizerState(), &trace));
+
+    EXPECT_TRUE(std::any_of(trace.activations.cbegin(), trace.activations.cend(), [](const MidiExportActivation& activation) {
+        // A tied pair contributes two noteheads, their stems, and at least one TieSegment.
+        return activation.visualElementIds.size() >= 5;
+    }));
 }
 
 //! FIXME: update ref

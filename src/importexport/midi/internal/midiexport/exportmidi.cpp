@@ -22,7 +22,17 @@
 
 #include "exportmidi.h"
 
+#include <algorithm>
+#include <deque>
+#include <map>
+#include <set>
+#include <tuple>
+
+#include "engraving/dom/accidental.h"
+#include "engraving/dom/chord.h"
 #include "engraving/dom/chordrest.h"
+#include "engraving/dom/engravingobject.h"
+#include "engraving/dom/harmony.h"
 #include "engraving/dom/key.h"
 #include "engraving/dom/lyrics.h"
 #include "engraving/dom/masterscore.h"
@@ -32,8 +42,10 @@
 #include "engraving/dom/repeatlist.h"
 #include "engraving/dom/sig.h"
 #include "engraving/dom/staff.h"
+#include "engraving/dom/stem.h"
 #include "engraving/dom/synthesizerstate.h"
 #include "engraving/dom/tempotimeline.h"
+#include "engraving/dom/tie.h"
 
 #include "engraving/compat/midi/event.h"
 #include "engraving/compat/midi/compatmidirender.h"
@@ -43,6 +55,184 @@
 using namespace mu::engraving;
 
 namespace mu::iex::midi {
+static std::string ensureElementId(const EngravingObject* item)
+{
+    if (!item) {
+        return {};
+    }
+
+    EID eid = item->eid();
+    if (!eid.isValid()) {
+        eid = item->assignNewEID();
+    }
+    return eid.toStdString();
+}
+
+static std::vector<std::string> sourceElementIds(const NPlayEvent& event)
+{
+    std::vector<std::string> result;
+    if (const Note* note = event.note()) {
+        result.push_back(ensureElementId(note));
+    } else if (const Harmony* harmony = event.harmony()) {
+        result.push_back(ensureElementId(harmony));
+    }
+    return result;
+}
+
+static void appendElementId(std::vector<std::string>& result, const EngravingObject* item)
+{
+    const std::string elementId = ensureElementId(item);
+    if (!elementId.empty() && std::find(result.cbegin(), result.cend(), elementId) == result.cend()) {
+        result.push_back(elementId);
+    }
+}
+
+static std::vector<std::string> visualElementIds(const Note* sourceNote)
+{
+    std::vector<std::string> result;
+    if (!sourceNote) {
+        return result;
+    }
+
+    const Note* firstNote = sourceNote;
+    std::set<const Note*> backwardNotes { firstNote };
+    while (const Tie* incomingTie = firstNote->tieBack()) {
+        const Note* previousNote = incomingTie->startNote();
+        if (!previousNote || !backwardNotes.insert(previousNote).second) {
+            break;
+        }
+        firstNote = previousNote;
+    }
+
+    std::set<const Note*> visitedNotes;
+    const Note* note = firstNote;
+    while (note && visitedNotes.insert(note).second) {
+        appendElementId(result, note);
+        appendElementId(result, note->accidental());
+        if (const Chord* chord = note->chord()) {
+            appendElementId(result, chord->stem());
+        }
+
+        const Tie* outgoingTie = note->tieFor();
+        if (!outgoingTie) {
+            break;
+        }
+        for (const SpannerSegment* segment : outgoingTie->spannerSegments()) {
+            appendElementId(result, segment);
+        }
+        note = outgoingTie->endNote();
+    }
+
+    return result;
+}
+
+static MidiEvent tracedMidiEvent(int type, int channel, int dataA, int dataB, const NPlayEvent& source, bool includeSource)
+{
+    MidiEvent result(type, channel, dataA, dataB);
+    if (includeSource) {
+        result.setSourceElementIds(sourceElementIds(source));
+    }
+    return result;
+}
+
+static void collectActivations(const EventsHolder& events, const CompatMidiRendererInternal::Context& context,
+                               MidiExportTrace* trace)
+{
+    if (!trace) {
+        return;
+    }
+
+    struct ActivationStart {
+        int tick = 0;
+        std::vector<std::string> visualElementIds;
+    };
+    using ActivationKey = std::tuple<std::string, int, int>;
+    std::map<ActivationKey, std::deque<ActivationStart>> starts;
+
+    for (size_t channel = 0; channel < events.size(); ++channel) {
+        for (const auto& [tick, event] : events[channel]) {
+            if (event.type() != ME_NOTEON || event.isMuted()) {
+                continue;
+            }
+
+            const std::vector<std::string> elementIds = sourceElementIds(event);
+            if (elementIds.empty()) {
+                continue;
+            }
+
+            const std::string& elementId = elementIds.front();
+            const ActivationKey key { elementId, event.channel(), event.pitch() };
+            const int midiTick = CompatMidiRender::tick(context, tick);
+            if (event.velo() > 0) {
+                starts[key].push_back({ midiTick, visualElementIds(event.note()) });
+                continue;
+            }
+
+            auto found = starts.find(key);
+            if (found == starts.end() || found->second.empty()) {
+                continue;
+            }
+
+            MidiExportActivation activation;
+            activation.elementId = elementId;
+            activation.visualElementIds = std::move(found->second.front().visualElementIds);
+            activation.startTick = found->second.front().tick;
+            activation.endTick = midiTick;
+            activation.channel = event.channel();
+            activation.pitch = event.pitch();
+            found->second.pop_front();
+            trace->activations.push_back(std::move(activation));
+        }
+    }
+
+    std::stable_sort(trace->activations.begin(), trace->activations.end(),
+                     [](const MidiExportActivation& left, const MidiExportActivation& right) {
+        return std::tie(left.startTick, left.endTick, left.elementId, left.channel, left.pitch)
+               < std::tie(right.startTick, right.endTick, right.elementId, right.channel, right.pitch);
+    });
+    std::map<std::string, size_t> occurrences;
+    for (MidiExportActivation& activation : trace->activations) {
+        activation.occurrence = occurrences[activation.elementId]++;
+    }
+}
+
+static void collectFinalEvents(const MidiFile& midiFile, MidiExportTrace* trace)
+{
+    if (!trace) {
+        return;
+    }
+
+    trace->format = midiFile.format();
+    trace->division = midiFile.division();
+    size_t trackIndex = 0;
+    for (const MidiTrack& track : midiFile.tracks()) {
+        size_t ordinal = 0;
+        for (const auto& [tick, event] : track.events()) {
+            MidiExportEventTrace item;
+            item.track = trackIndex;
+            item.ordinal = ordinal++;
+            item.tick = tick;
+            item.type = event.type();
+            item.channel = event.channel();
+            item.dataA = event.dataA();
+            item.dataB = event.dataB();
+            item.metaType = event.metaType();
+            if (event.type() == ME_CONTROLLER && event.controller() == CTRL_PROGRAM) {
+                item.type = ME_PROGRAM;
+                item.dataA = event.value() & 0x7f;
+                item.dataB = 0;
+            } else if (event.type() == ME_CONTROLLER && event.controller() == CTRL_PRESS) {
+                item.type = ME_AFTERTOUCH;
+                item.dataA = event.value() & 0x7f;
+                item.dataB = 0;
+            }
+            item.sourceElementIds = event.sourceElementIds();
+            trace->events.push_back(std::move(item));
+        }
+        ++trackIndex;
+    }
+}
+
 //---------------------------------------------------------
 //   writeHeader
 //---------------------------------------------------------
@@ -213,8 +403,12 @@ void ExportMidi::writeHeader(const CompatMidiRendererInternal::Context& context)
 //    from mscore->synthesizerState() as the synthState parameter.
 //---------------------------------------------------------
 
-bool ExportMidi::write(QIODevice* device, bool midiExpandRepeats, bool exportRPNs, const SynthesizerState& synthState)
+bool ExportMidi::write(QIODevice* device, bool midiExpandRepeats, bool exportRPNs, const SynthesizerState& synthState,
+                       MidiExportTrace* trace)
 {
+    if (trace) {
+        trace->clear();
+    }
     m_midiFile.setDivision(Constants::DIVISION);
     m_midiFile.setFormat(1);
     std::vector<MidiTrack>& tracks = m_midiFile.tracks();
@@ -233,6 +427,7 @@ bool ExportMidi::write(QIODevice* device, bool midiExpandRepeats, bool exportRPN
     context.applyCaesuras = true;
 
     CompatMidiRender::renderScore(m_score, events, context, midiExpandRepeats);
+    collectActivations(events, context, trace);
 
     writeHeader(context);
 
@@ -303,8 +498,8 @@ bool ExportMidi::write(QIODevice* device, bool midiExpandRepeats, bool exportRPN
                         }
                         if (event.discard() == staffIdx + 1 && event.velo() > 0) {
                             // turn note off so we can restrike it in another track
-                            track.insert(CompatMidiRender::tick(context, item.first), MidiEvent(ME_NOTEON, channel,
-                                                                                                event.pitch(), 0));
+                            track.insert(CompatMidiRender::tick(context, item.first),
+                                         tracedMidiEvent(ME_NOTEON, channel, event.pitch(), 0, event, trace != nullptr));
                         }
 
                         staff_idx_t equivalentStaffIdx = staffIdx;
@@ -337,20 +532,20 @@ bool ExportMidi::write(QIODevice* device, bool midiExpandRepeats, bool exportRPN
                         if (event.type() == ME_NOTEON) {
                             // use the note values instead of the event values if portamento is suppressed
                             if (!exportRPNs && event.portamento()) {
-                                track.insert(CompatMidiRender::tick(context, item.first), MidiEvent(ME_NOTEON, channel,
-                                                                                                    event.note()->pitch(),
-                                                                                                    event.velo()));
+                                track.insert(CompatMidiRender::tick(context, item.first),
+                                             tracedMidiEvent(ME_NOTEON, channel, event.note()->pitch(), event.velo(), event,
+                                                             trace != nullptr));
                             } else {
-                                track.insert(CompatMidiRender::tick(context, item.first), MidiEvent(ME_NOTEON, channel,
-                                                                                                    event.pitch(), event.velo()));
+                                track.insert(CompatMidiRender::tick(context, item.first),
+                                             tracedMidiEvent(ME_NOTEON, channel, event.pitch(), event.velo(), event, trace != nullptr));
                             }
                         } else if (event.type() == ME_CONTROLLER) {
-                            track.insert(CompatMidiRender::tick(context, item.first), MidiEvent(ME_CONTROLLER, channel,
-                                                                                                event.controller(),
-                                                                                                event.value()));
+                            track.insert(CompatMidiRender::tick(context, item.first),
+                                         tracedMidiEvent(ME_CONTROLLER, channel, event.controller(), event.value(), event,
+                                                         trace != nullptr));
                         } else if (event.type() == ME_PITCHBEND) {
-                            track.insert(CompatMidiRender::tick(context, item.first), MidiEvent(ME_PITCHBEND, channel,
-                                                                                                event.dataA(), event.dataB()));
+                            track.insert(CompatMidiRender::tick(context, item.first),
+                                         tracedMidiEvent(ME_PITCHBEND, channel, event.dataA(), event.dataB(), event, trace != nullptr));
                         } else {
                             LOGD("writeMidi: unknown midi event 0x%02x", event.type());
                         }
@@ -422,6 +617,7 @@ bool ExportMidi::write(QIODevice* device, bool midiExpandRepeats, bool exportRPN
         }
         ++staffIdx;
     }
+    collectFinalEvents(m_midiFile, trace);
     return !m_midiFile.write(device);
 }
 

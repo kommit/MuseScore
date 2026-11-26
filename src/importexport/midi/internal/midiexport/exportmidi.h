@@ -23,6 +23,10 @@
 #ifndef EXPORTMIDI_H
 #define EXPORTMIDI_H
 
+#include <cstddef>
+#include <string>
+#include <vector>
+
 #include <QFile>
 
 #include "../midishared/midifile.h"
@@ -35,6 +39,46 @@ class SynthesizerState;
 }
 
 namespace mu::iex::midi {
+struct MidiExportEventTrace
+{
+    size_t track = 0;
+    size_t ordinal = 0;
+    int tick = 0;
+    int type = 0;
+    int channel = 0;
+    int dataA = 0;
+    int dataB = 0;
+    int metaType = 0;
+    std::vector<std::string> sourceElementIds;
+};
+
+struct MidiExportActivation
+{
+    std::string elementId;
+    std::vector<std::string> visualElementIds;
+    size_t occurrence = 0;
+    int startTick = 0;
+    int endTick = 0;
+    int channel = 0;
+    int pitch = 0;
+};
+
+struct MidiExportTrace
+{
+    int format = 1;
+    int division = 0;
+    std::vector<MidiExportEventTrace> events;
+    std::vector<MidiExportActivation> activations;
+
+    void clear()
+    {
+        format = 1;
+        division = 0;
+        events.clear();
+        activations.clear();
+    }
+};
+
 //---------------------------------------------------------
 //   ExportMidi
 //---------------------------------------------------------
@@ -46,7 +90,8 @@ public:
     bool write(const QString& name, bool midiExpandRepeats, bool exportRPNs);
     bool write(QIODevice* device, bool midiExpandRepeats, bool exportRPNs);
     bool write(const QString& name, bool midiExpandRepeats, bool exportRPNs, const engraving::SynthesizerState& synthState);
-    bool write(QIODevice* device, bool midiExpandRepeats, bool exportRPNs, const engraving::SynthesizerState& synthState);
+    bool write(QIODevice* device, bool midiExpandRepeats, bool exportRPNs, const engraving::SynthesizerState& synthState,
+               MidiExportTrace* trace = nullptr);
 
 private:
     void writeHeader(const engraving::CompatMidiRendererInternal::Context& context);

@@ -23,6 +23,9 @@
 #ifndef MIDISHARED_MIDIEVENT_H
 #define MIDISHARED_MIDIEVENT_H
 
+#include <string>
+#include <vector>
+
 #include "engraving/compat/midi/midicoreevent.h"
 
 namespace mu::iex::midi {
@@ -32,6 +35,7 @@ protected:
     std::vector<uchar> _edata;
     int _len { 0 };
     int _metaType { 0 };
+    std::vector<std::string> _sourceElementIds;
 
 public:
     MidiEvent() {}
@@ -44,6 +48,8 @@ public:
     void setLen(int l) { _len = l; }
     int metaType() const { return _metaType; }
     void setMetaType(int v) { _metaType = v; }
+    const std::vector<std::string>& sourceElementIds() const { return _sourceElementIds; }
+    void setSourceElementIds(std::vector<std::string> ids) { _sourceElementIds = std::move(ids); }
 };
 }
 
